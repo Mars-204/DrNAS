@@ -59,6 +59,13 @@ DrNAS can perform a direct search on ImageNet and achieves a top-1 test error be
 <sup>*<sup> not a direct search
 
 
+# Augmix for out of distribution(OOD) robustness.
+https://arxiv.org/abs/1912.02781
+
+Augmix in search phase and evaluation phase is integrated in the code along with jsd loss function(As implemented in AUGMIX paper : ). For applying AUGMIX use:
+--args.augment = True
+--args.augmix_search = True (for application in search phase only)
+--args.augmix_eval = True (for application in eval phase only)
 
 ## Usage
 
@@ -99,8 +106,12 @@ If you find this code useful in your research please cite
     url={https://openreview.net/forum?id=9FWas6YbmB3}
 }
 ```
-
-
+```
+git status
+git add .
+git commit -m 'your message here'
+git push origin develop
+```
 
 ## Related Publications
 

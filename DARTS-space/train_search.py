@@ -41,12 +41,14 @@ parser.add_argument('--train_portion', type=float, default=0.5, help='portion of
 parser.add_argument('--unrolled', action='store_true', default=False, help='use one-step unrolled validation loss')
 parser.add_argument('--arch_learning_rate', type=float, default=6e-4, help='learning rate for arch encoding')
 parser.add_argument('--k', type=int, default=6, help='init partial channel parameter')
+parser.add_argument('--augmix', type=bool, default=True, help='augmix implementation')
+parser.add_argument('--test_corr', type=bool, default=True, help='test on corrupted dataset')
 #### regularization
 parser.add_argument('--reg_type', type=str, default='l2', choices=['l2', 'kl'], help='regularization type')
 parser.add_argument('--reg_scale', type=float, default=1e-3, help='scaling factor of the regularization term, default value is proper for l2, for kl you might adjust reg_scale to match l2')
 args = parser.parse_args()
 
-args.save = '../experiments/{}/search-progressive-{}-{}-{}'.format(
+args.save = '/work/ws-tmp/g059997-DrNas/DrNAS/DARTS-space'.format(
     args.dataset, args.save, time.strftime("%Y%m%d-%H%M%S"), args.seed)
 args.save += '-init_channels-' + str(args.init_channels)
 args.save += '-layers-' + str(args.layers) 
@@ -93,12 +95,19 @@ def main():
     momentum=args.momentum,
     weight_decay=args.weight_decay)
 
-  train_transform, valid_transform = utils._data_transforms_cifar10(args)
+  if args.augmix:
+    rain_transform, valid_transform = utils._data_transforms_cifar10_augmix(args)
+  else:
+    train_transform, valid_transform = utils._data_transforms_cifar10(args)
+
+  # train_transform, valid_transform = utils._data_transforms_cifar10(args)
   if args.dataset=='cifar100':
     train_data = dset.CIFAR100(root=args.data, train=True, download=True, transform=train_transform)
   else:
     train_data = dset.CIFAR10(root=args.data, train=True, download=True, transform=train_transform)
 
+  if args.augmix:
+    train_data = utils.AugMixDataset(train_data)
   num_train = len(train_data)
   indices = list(range(num_train))
   split = int(np.floor(args.train_portion * num_train))
@@ -161,6 +170,13 @@ def main():
   genotype = model.genotype()
   logging.info('genotype = %s', genotype)
   model.show_arch_parameters()
+  if args.test_corr:
+                mean_CE = utils.test_corr(model, args.dataset, args)
+                logging.info(
+                "Corruption Evaluation finished. Mean Corruption Error: {:.9}".format(
+                    mean_CE
+                )
+            )
 
 
 def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, epoch):
@@ -169,13 +185,20 @@ def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, 
   top5 = utils.AvgrageMeter()
 
   for step, (input, target) in enumerate(train_queue):
+    if args.augmix:
+      input = torch.cat(input,0).cuda()
     model.train()
     n = input.size(0)
     input = input.cuda()
     target = target.cuda(non_blocking=True)
 
     # get a random minibatch from the search queue with replacement
-    input_search, target_search = next(iter(valid_queue))
+    data_val = next(iter(valid_queue))
+    if args.augmix:
+      data_val[0] = torch.cat(data_val[0],0).cuda()
+    input_search = data_val[0]
+    target_search = data_val[1]
+    # input_search, target_search = next(iter(valid_queue))
     input_search = input_search.cuda()
     target_search = target_search.cuda(non_blocking=True)
 
@@ -185,7 +208,14 @@ def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, 
     architect.optimizer.zero_grad()
 
     logits = model(input)
-    loss = criterion(logits, target)
+    # implementation of augmix
+    if args.augmix:
+      logits, augmix_loss = jsd_loss(logits)
+      train_loss = criterion(logits, target)
+      loss =  train_loss + augmix_loss
+    else:
+      loss = criterion(logits, target)
+    # loss = criterion(logits, target)
 
     loss.backward()
     nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -214,10 +244,14 @@ def infer(valid_queue, model, criterion):
 
   with torch.no_grad():
     for step, (input, target) in enumerate(valid_queue):
+      if args.augmix:
+        input = torch.cat(input,0).cuda()
       input = input.cuda()
       target = target.cuda(non_blocking=True)
       
       logits = model(input)
+      if args.augmix:
+        logits, _ = jsd_loss(logits)
       loss = criterion(logits, target)
 
       prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
@@ -233,6 +267,16 @@ def infer(valid_queue, model, criterion):
 
   return top1.avg, objs.avg
 
+## jsd loss integration with augmix
+def jsd_loss(logits_train):
+    logits_train, logits_aug1, logits_aug2 = torch.split(logits_train, len(logits_train) // 3)
+    p_clean, p_aug1, p_aug2 = F.softmax(logits_train, dim=1), F.softmax(logits_aug1, dim=1), F.softmax(logits_aug2, dim=1)
 
+    p_mixture = torch.clamp((p_clean + p_aug1 + p_aug2) / 3., 1e-7, 1).log()
+    augmix_loss = 12 * (F.kl_div(p_mixture, p_clean, reduction='batchmean') +
+                F.kl_div(p_mixture, p_aug1, reduction='batchmean') +
+                F.kl_div(p_mixture, p_aug2, reduction='batchmean')) / 3.
+    return logits_train, augmix_loss
+    
 if __name__ == '__main__':
   main() 

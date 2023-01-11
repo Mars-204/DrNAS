@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import torch.nn as nn
 from torch.autograd import Variable
+import utils
 
 
 def _concat(xs):
@@ -11,6 +12,7 @@ def _concat(xs):
 class Architect(object):
 
   def __init__(self, model, args):
+    self.augment = args.augment
     self.network_momentum = args.momentum
     self.network_weight_decay = args.weight_decay
     self.model = model
@@ -22,7 +24,11 @@ class Architect(object):
         lr=args.arch_learning_rate, betas=(0.5, 0.999), weight_decay=weight_decay)
 
   def _compute_unrolled_model(self, input, target, eta, network_optimizer):
-    loss = self.model._loss(input, target)
+    if self.augment:
+            input, augmix_loss = utils.jsd_loss(input)
+            loss = self.model._loss(input, target) + augmix_loss
+    else:
+      loss = self.model._loss(input, target)
     theta = _concat(self.model.parameters()).data
     try:
       moment = _concat(network_optimizer.state[v]['momentum_buffer'] for v in self.model.parameters()).mul_(self.network_momentum)
@@ -50,11 +56,15 @@ class Architect(object):
   #     state['exp_avg_sq'][~mask] = 0.0
 
   def _backward_step(self, input_valid, target_valid):
+    if self.augment:
+      input_valid, _, _ = torch.split(input_valid, len(input_valid) // 3)
     loss = self.model._loss(input_valid, target_valid)
     loss.backward()
 
   def _backward_step_unrolled(self, input_train, target_train, input_valid, target_valid, eta, network_optimizer):
     unrolled_model = self._compute_unrolled_model(input_train, target_train, eta, network_optimizer)
+    if self.augment:
+      input_valid, _, _ = torch.split(input_valid, len(input_valid) // 3)
     unrolled_loss = unrolled_model._loss(input_valid, target_valid)
 
     unrolled_loss.backward()
@@ -90,12 +100,22 @@ class Architect(object):
     R = r / _concat(vector).norm()
     for p, v in zip(self.model.parameters(), vector):
       p.data.add_(R, v)
-    loss = self.model._loss(input, target)
+    if self.augment:
+            input, augmix_loss = utils.jsd_loss(input)
+            loss = self.model._loss(input, target) + augmix_loss
+    else:
+      loss = self.model._loss(input, target)
+    # loss = self.model._loss(input, target)
     grads_p = torch.autograd.grad(loss, self.model.arch_parameters())
 
     for p, v in zip(self.model.parameters(), vector):
       p.data.sub_(2*R, v)
-    loss = self.model._loss(input, target)
+    if self.augment:
+            input, augmix_loss = utils.jsd_loss(input)
+            loss = self.model._loss(input, target) + augmix_loss
+    else:
+      loss = self.model._loss(input, target)
+    # loss = self.model._loss(input, target)
     grads_n = torch.autograd.grad(loss, self.model.arch_parameters())
 
     for p, v in zip(self.model.parameters(), vector):

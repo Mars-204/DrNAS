@@ -19,7 +19,6 @@ from search_model_gdas import TinyNetworkGDAS
 from search_model import TinyNetwork
 from cell_operations import NAS_BENCH_201
 from architect import Architect
-
 from copy import deepcopy
 from numpy import linalg as LA
 
@@ -30,7 +29,7 @@ from nas_201_api import NASBench201API as API
 parser = argparse.ArgumentParser("sota")
 parser.add_argument('--data', type=str, default='datapath', help='location of the data corpus')
 parser.add_argument('--dataset', type=str, default='cifar10', help='choose dataset')
-parser.add_argument('--method', type=str, default='dirichlet', help='choose nas method')
+parser.add_argument('--method', type=str, default='darts', help='choose nas method')
 parser.add_argument('--batch_size', type=int, default=64, help='batch size')
 parser.add_argument('--learning_rate', type=float, default=0.025, help='init learning rate')
 parser.add_argument('--learning_rate_min', type=float, default=0.001, help='min learning rate')
@@ -39,7 +38,7 @@ parser.add_argument('--weight_decay', type=float, default=3e-4, help='weight dec
 parser.add_argument('--report_freq', type=float, default=50, help='report frequency')
 parser.add_argument('--gpu', type=int, default=0, help='gpu device id')
 parser.add_argument('--epochs', type=int, default=100, help='num of training epochs')
-parser.add_argument('--init_channels', type=int, default=16, help='num of init channels')
+parser.add_argument('--init_channels', type=int, default=36, help='num of init channels')
 parser.add_argument('--cutout', action='store_true', default=False, help='use cutout')
 parser.add_argument('--cutout_length', type=int, default=16, help='cutout length')
 parser.add_argument('--cutout_prob', type=float, default=1.0, help='cutout probability')
@@ -53,7 +52,10 @@ parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weigh
 parser.add_argument('--tau_max', type=float, default=10, help='Max temperature (tau) for the gumbel softmax.')
 parser.add_argument('--tau_min', type=float, default=1, help='Min temperature (tau) for the gumbel softmax.')
 parser.add_argument('--k', type=int, default=1, help='partial channel parameter')
-parser.add_argument('--augmix', type=bool, default=True, help='augmix implementation')
+parser.add_argument('--augment', type=bool, default=False, help='augmentation of dataset for augmix application')
+parser.add_argument('--augmix_search', type=bool, default=False, help='augmix implementation in search phase')
+parser.add_argument('--augmix_eval', type=bool, default=False, help='augmix implementation in evaluation phase')
+parser.add_argument('--test_corr', type=bool, default=True, help='test on corrupted dataset')
 #### regularization
 parser.add_argument('--reg_type', type=str, default='l2', choices=[
                     'l2', 'kl'], help='regularization type, kl is implemented for dirichlet only')
@@ -146,7 +148,7 @@ def main():
                             criterion=criterion, search_space=NAS_BENCH_201, k=args.k, species='dirichlet',
                             reg_type=args.reg_type, reg_scale=args.reg_scale)
     elif args.method == 'darts':
-        model = TinyNetwork(C=args.init_channels, N=5, max_nodes=4, num_classes=n_classes,
+        model = TinyNetwork(C=args.init_channels, N=20, max_nodes=4, num_classes=n_classes,
                             criterion=criterion, search_space=NAS_BENCH_201, k=args.k, species='softmax')
     model = model.cuda()
     logging.info("param size = %fMB", utils.count_parameters_in_MB(model))
@@ -158,14 +160,15 @@ def main():
         weight_decay=args.weight_decay)
 
     if args.dataset == 'cifar10':
-        if args.augmix:
+        if args.augment:
             train_transform, valid_transform = utils._data_transforms_cifar10_augmix(args)
         else:
             train_transform, valid_transform = utils._data_transforms_cifar10(args)
         # train_transform, valid_transform = utils._data_transforms_cifar10(args)
         train_data = dset.CIFAR10(root=args.data, train=True, download=True, transform=train_transform)
-        if args.augmix:
+        if args.augment:
             train_data = utils.AugMixDataset(train_data)
+        test_data = dset.CIFAR10(root=args.data, train=False, download=True, transform=valid_transform)
     elif args.dataset == 'cifar100':
         train_transform, valid_transform = utils._data_transforms_cifar100(args)
         train_data = dset.CIFAR100(root=args.data, train=True, download=True, transform=train_transform)
@@ -195,12 +198,21 @@ def main():
         train_data, batch_size=args.batch_size,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split:num_train]),
         pin_memory=True)
+    
+    test_queue = torch.utils.data.DataLoader(
+        test_data, batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=0,
+        worker_init_fn=np.random.seed(args.seed),
+    )
+
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, float(args.epochs), eta_min=args.learning_rate_min)
 
     architect = Architect(model, args)
-
+    
     for epoch in range(args.epochs):
         lr = scheduler.get_lr()[0]
         logging.info('epoch %d lr %e', epoch, lr)
@@ -249,9 +261,16 @@ def main():
             logging.info('tau %f', tau_epoch)
             model.set_tau(tau_epoch)
 
+        scheduler.step()
+        if args.method == 'gdas' or args.method == 'snas':
+            # Decrease the temperature for the gumbel softmax linearly
+            tau_epoch += tau_step
+            logging.info('tau %f', tau_epoch)
+            model.set_tau(tau_epoch)
+
     writer.close()
     if args.test_corr:
-                mean_CE = utils.test_corr(model, self.eval_dataset, self.config)
+                mean_CE = utils.test_corr(model, args.dataset, args)
                 logging.info(
                 "Corruption Evaluation finished. Mean Corruption Error: {:.9}".format(
                     mean_CE
@@ -264,7 +283,7 @@ def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, 
     top5 = utils.AvgrageMeter()
 
     for step, (input, target) in enumerate(train_queue):
-        if args.augmix:
+        if args.augmix_search:
             input = torch.cat(input,0).cuda()
         model.train()
         n = input.size(0)
@@ -274,7 +293,7 @@ def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, 
 
         # get a random minibatch from the search queue with replacement
         data_val = next(iter(valid_queue))
-        if args.augmix:
+        if args.augmix_search:
             data_val[0] = torch.cat(data_val[0],0).cuda()
         input_search = data_val[0]
         target_search = data_val[1]
@@ -289,7 +308,7 @@ def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, 
         
         logits = model(input)
         # implementation of augmix
-        if args.augmix:
+        if args.augmix_search:
             logits, augmix_loss = jsd_loss(logits)
             train_loss = criterion(logits, target)
             loss =  train_loss + augmix_loss

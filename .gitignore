@@ -3,3 +3,11 @@ __pycache__
 
 experiments/
 201-space/nas_201_api
+201-space/NAS-Bench-201-v1_1-096897.pth
+201-space/NATS-bench
+201-space/datapath
+201-space/slrum-1651691.out
+data/
+201-space/201-space-pc-1
+*.tar
+*.out
