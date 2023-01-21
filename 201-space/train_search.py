@@ -21,6 +21,9 @@ from cell_operations import NAS_BENCH_201
 from architect import Architect
 from copy import deepcopy
 from numpy import linalg as LA
+from xautodl.models import get_cell_based_tiny_net
+from nats_bench import create
+from nats_bench.api_utils import pickle_load
 
 from torch.utils.tensorboard import SummaryWriter
 from nas_201_api import NASBench201API as API
@@ -29,7 +32,7 @@ from nas_201_api import NASBench201API as API
 parser = argparse.ArgumentParser("sota")
 parser.add_argument('--data', type=str, default='datapath', help='location of the data corpus')
 parser.add_argument('--dataset', type=str, default='cifar10', help='choose dataset')
-parser.add_argument('--method', type=str, default='darts', help='choose nas method')
+parser.add_argument('--method', type=str, default='dirichlet', help='choose nas method from dirichlet,darts,gdas')
 parser.add_argument('--batch_size', type=int, default=64, help='batch size')
 parser.add_argument('--learning_rate', type=float, default=0.025, help='init learning rate')
 parser.add_argument('--learning_rate_min', type=float, default=0.001, help='min learning rate')
@@ -38,7 +41,7 @@ parser.add_argument('--weight_decay', type=float, default=3e-4, help='weight dec
 parser.add_argument('--report_freq', type=float, default=50, help='report frequency')
 parser.add_argument('--gpu', type=int, default=0, help='gpu device id')
 parser.add_argument('--epochs', type=int, default=100, help='num of training epochs')
-parser.add_argument('--init_channels', type=int, default=36, help='num of init channels')
+parser.add_argument('--init_channels', type=int, default=16, help='num of init channels')
 parser.add_argument('--cutout', action='store_true', default=False, help='use cutout')
 parser.add_argument('--cutout_length', type=int, default=16, help='cutout length')
 parser.add_argument('--cutout_prob', type=float, default=1.0, help='cutout probability')
@@ -52,10 +55,13 @@ parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weigh
 parser.add_argument('--tau_max', type=float, default=10, help='Max temperature (tau) for the gumbel softmax.')
 parser.add_argument('--tau_min', type=float, default=1, help='Min temperature (tau) for the gumbel softmax.')
 parser.add_argument('--k', type=int, default=1, help='partial channel parameter')
-parser.add_argument('--augment', type=bool, default=False, help='augmentation of dataset for augmix application')
-parser.add_argument('--augmix_search', type=bool, default=False, help='augmix implementation in search phase')
-parser.add_argument('--augmix_eval', type=bool, default=False, help='augmix implementation in evaluation phase')
+parser.add_argument('--augment', type=bool, default=True, help='augmentation of dataset for augmix application')
+parser.add_argument('--augmix_search', type=bool, default=True, help='augmix implementation in search phase')
+parser.add_argument('--augmix_eval', type=bool, default=True, help='augmix implementation in evaluation phase')
 parser.add_argument('--test_corr', type=bool, default=True, help='test on corrupted dataset')
+parser.add_argument('--evaluation', type=bool, default=True, help='evaluation of the obtained network')
+parser.add_argument('--epochs_eval', type=int, default=200, help='num of training epochs for evaluation phase')
+parser.add_argument('--drop_path_prob', type=float, default=0.2, help='drop path probability')
 #### regularization
 parser.add_argument('--reg_type', type=str, default='l2', choices=[
                     'l2', 'kl'], help='regularization type, kl is implemented for dirichlet only')
@@ -148,7 +154,7 @@ def main():
                             criterion=criterion, search_space=NAS_BENCH_201, k=args.k, species='dirichlet',
                             reg_type=args.reg_type, reg_scale=args.reg_scale)
     elif args.method == 'darts':
-        model = TinyNetwork(C=args.init_channels, N=20, max_nodes=4, num_classes=n_classes,
+        model = TinyNetwork(C=args.init_channels, N=5, max_nodes=4, num_classes=n_classes,
                             criterion=criterion, search_space=NAS_BENCH_201, k=args.k, species='softmax')
     model = model.cuda()
     logging.info("param size = %fMB", utils.count_parameters_in_MB(model))
@@ -220,15 +226,15 @@ def main():
         genotype = model.genotype()
         logging.info('genotype = %s', genotype)
         model.show_arch_parameters()
-
+        # import ipdb; ipdb.set_trace()
         # training
         train_acc, train_obj = train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, epoch)
         logging.info('train_acc %f', train_acc)
-
+        
         # validation
         valid_acc, valid_obj = infer(valid_queue, model, criterion)
         logging.info('valid_acc %f', valid_acc)
-
+        
         if not 'debug' in args.save:
             # nasbench201
             result = api.query_by_arch(model.genotype(), hp = '200')
@@ -268,14 +274,168 @@ def main():
             logging.info('tau %f', tau_epoch)
             model.set_tau(tau_epoch)
 
-    writer.close()
-    if args.test_corr:
-                mean_CE = utils.test_corr(model, args.dataset, args)
-                logging.info(
-                "Corruption Evaluation finished. Mean Corruption Error: {:.9}".format(
-                    mean_CE
-                )
+    ## Obtaining full architecture from NATS bench along with the weights
+    api = create('/work/ws-tmp/g059997-naslib/g059997-naslib-1667607005/NASLib_mod/naslib/NATS-bench/NATS-tss-v1_0-3ffb9-full/NATS-tss-v1_0-3ffb9-full', 'tss', fast_mode=True, verbose=True)
+    index = api.query_index_by_arch(model.genotype())
+    cifar10_acc = api.get_more_info(index, 'cifar10', hp='200', is_random=False)['test-accuracy']
+    cifar100_acc = api.get_more_info(index, 'cifar100', hp='200', is_random=False)['test-accuracy']
+    img_acc = api.get_more_info(index, 'ImageNet16-120', hp='200', is_random=False)['test-accuracy']
+    logging.info("TEST ACCURACIES: \n\t{}: {}\n\t{}: {}\n\t{}: {}".format('cifar10', cifar10_acc, 'cifar100', cifar100_acc, 'ImageNet16-120', img_acc))
+
+    config = api.get_net_config(index, 'cifar10')
+    best_arch = get_cell_based_tiny_net(config)
+    params = api.get_net_param(index, 'cifar10', None , hp = '200')
+    best_arch.load_state_dict(next(iter(params.values())))
+
+    best_c10_acc = cifar10_acc
+    
+    best_c100_acc = cifar100_acc
+    best_img_acc = img_acc
+    # model_path = search_model
+    # self.architecture = best_arch.modules_str()
+
+    
+    model = best_arch
+    # if args.test_corr:
+    #             mean_CE = utils.test_corr(model, args.dataset, args)
+    #             logging.info(
+    #             "Corruption Evaluation finished. Mean Corruption Error: {:.9}".format(
+    #                 mean_CE
+    #             )
+    #         )
+    
+    ## Retrain from scratch
+    top1 = utils.AverageMeter()
+    top5 = utils.AverageMeter()
+    
+    if args.evaluation:
+        model = reset_weights(model=model, inplace=True)
+        print('Retraining from scratch')
+        for epoch in range(args.epochs_eval):
+            model.train()
+            scheduler.step()
+            logging.info('epoch %d lr %e', epoch, scheduler.get_lr()[0])
+            model.drop_path_prob = args.drop_path_prob * epoch / args.epochs
+
+            train_acc, train_obj = train_eval(train_queue, model, criterion, optimizer)
+            logging.info('train_acc %f', train_acc)
+
+            valid_acc, valid_obj = infer_eval(valid_queue, model, criterion)
+            logging.info('valid_acc %f', valid_acc)
+
+            utils.save(model, os.path.join(args.save, 'weights.pt'))
+        top1 , top5 = test_eval(test_queue,model)
+
+        if args.test_corr:
+            mean_CE = utils.test_corr(model, args.dataset, args)
+            logging.info(
+            "Corruption Evaluation finished. Mean Corruption Error: {:.9}".format(
+                mean_CE
             )
+        )
+    writer.close()
+
+
+def train_eval(train_queue, model, criterion, optimizer):
+    objs = utils.AvgrageMeter()
+    top1 = utils.AvgrageMeter()
+    top5 = utils.AvgrageMeter()
+    model.train()
+    model.cuda()
+
+    for step, (input, target) in enumerate(train_queue):
+        if args.augment:
+            input = torch.cat(input,0).cuda()
+        input = input.cuda()
+        target = target.cuda(non_blocking =True)
+
+        optimizer.zero_grad()
+        _,logits = model(input)
+        if args.augmix_eval:
+            logits, augmix_loss = jsd_loss(logits)
+            loss = criterion(logits, target)
+            loss =  loss + augmix_loss
+        elif args.augment and not args.augmix_eval:
+            logits, _, _ = torch.split(logits, len(logits) // 3)
+            loss = criterion(logits, target)
+        else:
+            loss = criterion(logits, target)
+        # loss = criterion(logits, target)
+
+        # logits_aux = 
+        # if args.auxiliary:
+        #     loss_aux = criterion(logits_aux, target)
+        #     loss += args.auxiliary_weight*loss_aux
+        loss.backward()
+        nn.utils.clip_grad_norm(model.parameters(), args.grad_clip)
+        optimizer.step()
+        # import ipdb; ipdb.set_trace()
+        prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
+        n = input.size(0)
+        objs.update(loss.data, n)
+        top1.update(prec1.data, n)
+        top5.update(prec5.data, n)
+
+        if step % args.report_freq == 0:
+            logging.info('train %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
+
+    return top1.avg, objs.avg
+
+
+def infer_eval(valid_queue, model, criterion):
+    objs = utils.AvgrageMeter()
+    top1 = utils.AvgrageMeter()
+    top5 = utils.AvgrageMeter()
+    model.eval()
+    model.cuda()
+
+    for step, (input, target) in enumerate(valid_queue):
+        if args.augment:
+            input = torch.cat(input,0).cuda()
+        input = input.cuda()
+        target = target.cuda(non_blocking =True)
+        # import ipdb;ipdb.set_trace()
+        _, logits = model(input)
+        if args.augmix_eval:
+            logits,_ ,_ = torch.split(logits, len(logits) // 3)
+    
+        loss = criterion(logits, target)
+
+        prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
+        n = input.size(0)
+        objs.update(loss.data, n)
+        top1.update(prec1.data, n)
+        top5.update(prec5.data, n)
+
+        if step % args.report_freq == 0:
+            logging.info('valid %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
+
+    return top1.avg, objs.avg
+
+def test_eval(test_queue, model):
+    top1 = utils.AverageMeter()
+    top5 = utils.AverageMeter()
+    
+    for i, data_test in enumerate(test_queue):
+        input_test, target_test = data_test
+        input_test = input_test.cuda()
+        target_test = target_test.cuda(non_blocking = True)
+
+        n = input_test.size(0)
+
+        with torch.no_grad():
+            _, logits = model(input_test)
+
+            prec1, prec5 = utils.accuracy(logits, target_test, topk=(1, 5))
+            top1.update(prec1.data.item(), n)
+            top5.update(prec5.data.item(), n)
+
+    logging.info(
+        "Evaluation finished. Test accuracies: top-1 = {:.5}, top-5 = {:.5}".format(
+            top1.avg, top5.avg
+        )
+    )
+    return top1.avg, top5.avg
 
 def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, epoch):
     objs = utils.AvgrageMeter()
@@ -342,13 +502,13 @@ def infer(valid_queue, model, criterion):
 
     with torch.no_grad():
         for step, (input, target) in enumerate(valid_queue):
-            if args.augmix:
+            if args.augmix_search:
                 input = torch.cat(input,0).cuda()
             input = input.cuda()
             target = target.cuda(non_blocking=True)
 
             logits = model(input)
-            if args.augmix:
+            if args.augmix_search:
                 logits, _ = jsd_loss(logits)
             loss = criterion(logits, target)
 
@@ -364,6 +524,7 @@ def infer(valid_queue, model, criterion):
                 break
     return top1.avg, objs.avg
 
+
 ## jsd loss integration with augmix
 def jsd_loss(logits_train):
     logits_train, logits_aug1, logits_aug2 = torch.split(logits_train, len(logits_train) // 3)
@@ -375,6 +536,32 @@ def jsd_loss(logits_train):
                 F.kl_div(p_mixture, p_aug2, reduction='batchmean')) / 3.
     return logits_train, augmix_loss
 
+
+
+def reset_weights(model, inplace: bool = False):
+    """
+    Resets the weights for the 'op' at all edges.
+
+    Args:
+        inplace (bool): Do the operation in place or
+            return a modified copy.
+    Returns:
+        Graph: Returns the modified version of the graph.
+    """
+
+    def weight_reset(m):
+        reset_parameters = getattr(m, "reset_parameters", None)
+        if callable(reset_parameters):
+            m.reset_parameters()
+
+    if inplace:
+        graph = model
+    else:
+        graph = model.clone()
+
+    graph.apply(weight_reset)
+
+    return graph
 
 if __name__ == '__main__':
     main()
