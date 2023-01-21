@@ -29,6 +29,9 @@ class AvgrageMeter(object):
 
 
 def accuracy(output, target, topk=(1,)):
+  """
+  Calculate the accuracy given the softmax output and the target.
+  """
   maxk = max(topk)
   batch_size = target.size(0)
 
@@ -42,6 +45,19 @@ def accuracy(output, target, topk=(1,)):
     res.append(correct_k.mul_(100.0/batch_size))
   return res
 
+class AverageMeter(object):
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.avg = 0
+        self.sum = 0
+        self.cnt = 0
+
+    def update(self, val, n=1):
+        self.sum += val * n
+        self.cnt += n
+        self.avg = self.sum / self.cnt
 
 class Cutout(object):
   def __init__(self, length, prob = 1.0):
@@ -252,7 +268,7 @@ CORRUPTIONS = [
     'jpeg_compression'
 ]
 
-def test(net, test_loader):
+def test(net, test_loader,args):
     """Evaluate network on given dataset."""
     net.eval()
     net = net.cuda()
@@ -261,7 +277,7 @@ def test(net, test_loader):
     with torch.no_grad():
         for images, targets in test_loader:
             images, targets = images.cuda(), targets.cuda()
-            logits = net(images)
+            _, logits = net(images) # NATS bench api returns two values
             loss = torch.nn.functional.cross_entropy(logits, targets)
             pred = logits.data.max(1)[1]
             total_loss += float(loss.data)
@@ -303,7 +319,7 @@ def test_corr(net, dataset, args):
             num_workers=0,
             pin_memory=True)
 
-        test_loss, test_acc = test(net, test_loader)
+        test_loss, test_acc = test(net, test_loader,args)
         corruption_accs.append(test_acc)
         logging.info('{}\n\tTest Loss {:.3f} | Test Error {:.3f}'.format(
             corruption, test_loss, 100 - 100. * test_acc))
