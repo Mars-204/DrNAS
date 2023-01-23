@@ -46,7 +46,7 @@ parser.add_argument('--cutout', action='store_true', default=False, help='use cu
 parser.add_argument('--cutout_length', type=int, default=16, help='cutout length')
 parser.add_argument('--cutout_prob', type=float, default=1.0, help='cutout probability')
 parser.add_argument('--save', type=str, default='exp', help='experiment name')
-parser.add_argument('--seed', type=int, default=2, help='random seed')
+parser.add_argument('--seed', type=int, default=10, help='random seed')
 parser.add_argument('--grad_clip', type=float, default=5, help='gradient clipping')
 parser.add_argument('--train_portion', type=float, default=0.5, help='portion of training data')
 parser.add_argument('--unrolled', action='store_true', default=False, help='use one-step unrolled validation loss')
@@ -55,9 +55,9 @@ parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weigh
 parser.add_argument('--tau_max', type=float, default=10, help='Max temperature (tau) for the gumbel softmax.')
 parser.add_argument('--tau_min', type=float, default=1, help='Min temperature (tau) for the gumbel softmax.')
 parser.add_argument('--k', type=int, default=1, help='partial channel parameter')
-parser.add_argument('--augment', type=bool, default=True, help='augmentation of dataset for augmix application')
-parser.add_argument('--augmix_search', type=bool, default=True, help='augmix implementation in search phase')
-parser.add_argument('--augmix_eval', type=bool, default=True, help='augmix implementation in evaluation phase')
+parser.add_argument('--augment', type=bool, default=False, help='augmentation of dataset for augmix application')
+parser.add_argument('--augmix_search', type=bool, default=False, help='augmix implementation in search phase')
+parser.add_argument('--augmix_eval', type=bool, default=False, help='augmix implementation in evaluation phase')
 parser.add_argument('--test_corr', type=bool, default=True, help='test on corrupted dataset')
 parser.add_argument('--evaluation', type=bool, default=True, help='evaluation of the obtained network')
 parser.add_argument('--epochs_eval', type=int, default=200, help='num of training epochs for evaluation phase')
@@ -196,17 +196,26 @@ def main():
     split = int(np.floor(args.train_portion * num_train))
 
     train_queue = torch.utils.data.DataLoader(
-        train_data, batch_size=args.batch_size,
+        train_data, 
+        batch_size=args.batch_size,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[:split]),
-        pin_memory=True)
+        pin_memory=True,
+        num_workers=0,
+        worker_init_fn=np.random.seed(args.seed)
+    )
 
     valid_queue = torch.utils.data.DataLoader(
-        train_data, batch_size=args.batch_size,
+        train_data, 
+        batch_size=args.batch_size,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split:num_train]),
-        pin_memory=True)
+        pin_memory=True,
+        num_workers=0,
+        worker_init_fn=np.random.seed(args.seed)
+    )
     
     test_queue = torch.utils.data.DataLoader(
-        test_data, batch_size=args.batch_size,
+        test_data, 
+        batch_size=args.batch_size,
         shuffle=False,
         pin_memory=True,
         num_workers=0,
@@ -296,13 +305,13 @@ def main():
 
     
     model = best_arch
-    # if args.test_corr:
-    #             mean_CE = utils.test_corr(model, args.dataset, args)
-    #             logging.info(
-    #             "Corruption Evaluation finished. Mean Corruption Error: {:.9}".format(
-    #                 mean_CE
-    #             )
-    #         )
+    if args.test_corr:
+                mean_CE = utils.test_corr(model, args.dataset, args)
+                logging.info(
+                "Corruption Evaluation finished. Mean Corruption Error: {:.9}".format(
+                    mean_CE
+                )
+            )
     
     ## Retrain from scratch
     top1 = utils.AverageMeter()
